@@ -82,6 +82,10 @@ class AssistedThreadingWizard(
                 dev['assistedThreadingData']['spindleCountsPerRev'] = int(spindle_axis._steps_per_revolution())
                 dev['assistedThreadingData']['spindleScaleIndex'] = inp.inputIndex
 
+        self.bar.current_start = 1
+        self.bar.start_depths = {}
+        self.bar.multi_start_panel_visible = False
+
         self.goto_step(0)
 
     def stop(self):
@@ -96,6 +100,7 @@ class AssistedThreadingWizard(
         self.bar.action_button_condition_fn = None
         self.bar.is_running = False
         self.bar.retract_button_visible = False
+        self.bar.multi_start_panel_visible = False
         self._clear_bar_display()
         self._reset_servo_watch_callback()
         self._reset_encoder_stability_check()
@@ -341,6 +346,14 @@ class AssistedThreadingWizard(
         threading_delta_steps = self._get_threading_servo_delta_steps()
         dev = self.app.board.device
 
+        # Set spindle phase offset for multi-start threading
+        if self.bar.multi_start_enabled and self.bar.thread_starts > 1:
+            counts_per_rev = dev['assistedThreadingData']['spindleCountsPerRev']
+            phase_offset = (self.bar.current_start - 1) * counts_per_rev // self.bar.thread_starts
+            dev['assistedThreadingData']['threadPhaseRef'] = phase_offset
+        else:
+            dev['assistedThreadingData']['threadPhaseRef'] = 0
+
         if not self._threading_started:
             self._threading_started = True
             self._threading_active_confirmed = False
@@ -353,11 +366,15 @@ class AssistedThreadingWizard(
 
         log.info(
             f"Threading latch sent: threadRemainingSteps={threading_delta_steps}, "
+            f"start={self.bar.current_start}/{self.bar.thread_starts if self.bar.multi_start_enabled else 1}, "
             f"servoCurrent={self.app.board.fast_data_values['servoCurrent']}, "
             f"saddle_current={self.saddle_input.encoderCurrent}, stop={self.bar.stop_position}"
         )
 
-        self._servo_watch_callback = lambda *a: self._check_servo_threading_done(5, *a)
+        if self.bar.multi_start_enabled:
+            self._servo_watch_callback = self._watch_threading_pass_done_multistart
+        else:
+            self._servo_watch_callback = lambda *a: self._check_servo_threading_done(5, *a)
         self.app.board.bind(update_tick=self._servo_watch_callback)
 
     def _check_servo_threading_done(self, next_step: int, *args):
@@ -397,6 +414,121 @@ class AssistedThreadingWizard(
             self._reset_servo_watch_callback()
 
             self.goto_step(next_step)
+
+    # ---------------------------------------------------------------------------
+    # Multi-start threading helpers
+    # ---------------------------------------------------------------------------
+
+    def _watch_threading_pass_done_multistart(self, *args):
+        """Watch callback for multi-start mode — records depth and shows start selector when done."""
+        dev = self.app.board.device
+        dev['assistedThreadingData'].refresh()
+        threadPhaseActive = dev['assistedThreadingData']['threadPhaseActive']
+        threadEnabled = dev['assistedThreadingData']['threadEnabled']
+
+        if threadEnabled == 1 or threadPhaseActive == 1:
+            self._threading_active_confirmed = True
+
+        if self._threading_active_confirmed and threadEnabled == 0 and threadPhaseActive == 0:
+            log.info("Servo reached desired position (multi-start pass complete)")
+            self._reset_servo_watch_callback()
+            self._on_threading_pass_complete()
+
+    def _on_threading_pass_complete(self):
+        """Record depth for the current start and decide next action."""
+        self.bar.start_depths[self.bar.current_start] = self.bar.last_cutting_depth
+
+        if self._all_starts_at_depth():
+            self.goto_step(7)  # Step 8: _step_depth_reached
+        else:
+            self._show_start_selector()
+
+    def _all_starts_at_depth(self) -> bool:
+        """Return True when every start has been cut to at least cutting_depth."""
+        effective_dir = self._get_cross_slide_scale_effective_dir()
+        for k in range(1, self.bar.thread_starts + 1):
+            depth = self.bar.start_depths.get(k)
+            if depth is None:
+                return False
+            if (depth - self.bar.cutting_depth) * effective_dir < 0:
+                return False
+        return True
+
+    def _show_start_selector(self):
+        """Show the inter-pass start selector panel."""
+        n = self.bar.thread_starts
+        effective_dir = self._get_cross_slide_scale_effective_dir()
+        at_depth_count = sum(
+            1 for k in range(1, n + 1)
+            if self.bar.start_depths.get(k) is not None
+            and (self.bar.start_depths[k] - self.bar.cutting_depth) * effective_dir >= 0
+        )
+        self.set_instruction(
+            f"Pass complete. Select next start ({at_depth_count}/{n} at full depth)",
+            "",
+            None,
+            retract_button_visible=True,
+        )
+        self.bar.action_button_enabled = False
+        self.bar.multi_start_panel_visible = True
+        self._rebuild_start_selector_buttons()
+
+    def _rebuild_start_selector_buttons(self):
+        """Populate the start selector panel with one button per start."""
+        from kivy.uix.button import Button
+
+        panel = self.bar.ids.start_selector_panel
+        panel.clear_widgets()
+
+        n = self.bar.thread_starts
+        effective_dir = self._get_cross_slide_scale_effective_dir()
+
+        for k in range(1, n + 1):
+            depth_enc = self.bar.start_depths.get(k)
+
+            if depth_enc is None:
+                depth_label = "—"
+                bg_color = [0.35, 0.35, 0.35, 1]
+            else:
+                try:
+                    is_metric = self.app.formats.current_format == "MM"
+                    factor = float(self.app.formats.factor)
+                    scale_ratio = abs(float(Fraction(
+                        self.cross_slide_input.ratioNum,
+                        self.cross_slide_input.ratioDen,
+                    )) * factor)
+                    depth_from_surface = (depth_enc - self.bar.material_width) * effective_dir * scale_ratio
+                    depth_label = f"{depth_from_surface:.3f}" if is_metric else f"{depth_from_surface:.4f}"
+                except Exception:
+                    depth_label = "?"
+
+                at_depth = (depth_enc - self.bar.cutting_depth) * effective_dir >= 0
+                bg_color = [0.15, 0.55, 0.15, 1] if at_depth else [0.55, 0.45, 0.05, 1]
+
+            is_current = k == self.bar.current_start
+            btn_color = [min(c * 1.4, 1.0) for c in bg_color[:3]] + [1] if is_current else bg_color
+
+            btn = Button(
+                text=f"{k}\n{depth_label}",
+                background_color=btn_color,
+                font_name="fonts/iosevka-regular.ttf",
+                font_size=16,
+            )
+
+            def _make_cb(start_idx):
+                def _on_select(_instance):
+                    self._select_start(start_idx)
+                return _on_select
+
+            btn.bind(on_release=_make_cb(k))
+            panel.add_widget(btn)
+
+    def _select_start(self, start_index: int):
+        """User tapped a start button — update current_start and proceed to go-to-start."""
+        log.info(f"Multi-start: selected start {start_index} of {self.bar.thread_starts}")
+        self.bar.current_start = start_index
+        self.bar.multi_start_panel_visible = False
+        self.goto_step(5)
 
     # ---------------------------------------------------------------------------
     # Manual input keypads

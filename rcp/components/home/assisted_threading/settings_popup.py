@@ -67,3 +67,21 @@ class AssistedThreadingSettingsPopup(Popup):
     def on_compound_infeed_mode_changed(self, value):
         self.assistedThreadingBar.compound_infeed_mode = value
         log.info(f"Compound infeed mode changed to: {value}")
+
+    def on_multi_start_enabled_changed(self, value):
+        self.assistedThreadingBar.multi_start_enabled = value
+        log.info(f"Multi-start enabled changed to: {value}")
+
+    def on_thread_starts_changed(self, value):
+        try:
+            starts = max(2, min(8, int(value)))
+            self.assistedThreadingBar.thread_starts = starts
+            self.assistedThreadingBar.update_feeds_ratio(None, None)
+        except (ValueError, TypeError):
+            log.warning(f"Invalid thread_starts value: {value}")
+
+    def on_nominal_thread_diameter_changed(self, value):
+        try:
+            self.assistedThreadingBar.nominal_thread_diameter = max(0.0, float(value))
+        except (ValueError, TypeError):
+            log.warning(f"Invalid nominal_thread_diameter value: {value}")

@@ -68,6 +68,8 @@ def make_wizard(
     bar.thread_profile_type = "ISO Metric"
     bar.compound_infeed_mode = False
     bar.compound_infeed_offset_degrees = 1.0
+    bar.multi_start_enabled = False
+    bar.thread_starts = 2
 
     saddle_inp = _make_input(ratioNum, ratioDen, saddle_encoderCurrent)
     cross_inp = _make_input(ratioNum, ratioDen, cross_encoderCurrent)

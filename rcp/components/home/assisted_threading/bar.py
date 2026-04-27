@@ -1,6 +1,8 @@
+import math
+
 from kivy.logger import Logger
 from kivy.uix.boxlayout import BoxLayout
-from kivy.properties import NumericProperty, BooleanProperty, StringProperty
+from kivy.properties import NumericProperty, BooleanProperty, StringProperty, DictProperty
 
 from rcp import feeds
 from rcp.components.widgets.custom_popup import CustomPopup
@@ -27,6 +29,20 @@ class AssistedThreadingBar(BoxLayout, SavingDispatcher):
     compound_infeed_mode = BooleanProperty(False)
     compound_infeed_offset_degrees = NumericProperty(1.0)
 
+    # Multi-start threading (persisted)
+    multi_start_enabled = BooleanProperty(False)
+    thread_starts = NumericProperty(2)
+    nominal_thread_diameter = NumericProperty(0.0)
+
+    # Multi-start threading state (transient — reset on job start)
+    current_start = NumericProperty(1)
+    start_depths = DictProperty({})
+
+    # Multi-start UI state (transient)
+    multi_start_panel_visible = BooleanProperty(False)
+    lead_display_text = StringProperty("")
+    max_starts_warning_text = StringProperty("")
+
     is_running = BooleanProperty(False)
     action_button_enabled = BooleanProperty(True)
     label_text = StringProperty("")
@@ -50,7 +66,12 @@ class AssistedThreadingBar(BoxLayout, SavingDispatcher):
         "cutting_depth",
         "last_cutting_depth",
         "retract_button_visible",
-        "retract_button_enabled"
+        "retract_button_enabled",
+        "current_start",
+        "start_depths",
+        "multi_start_panel_visible",
+        "lead_display_text",
+        "max_starts_warning_text",
     ]
 
     def __init__(self, **kv):
@@ -70,6 +91,15 @@ class AssistedThreadingBar(BoxLayout, SavingDispatcher):
 
         self.app.bind(current_mode=self.on_mode_change)
         self.bind(left_hand_thread=self.update_feeds_ratio)
+        self.bind(multi_start_enabled=self.update_feeds_ratio)
+        self.bind(thread_starts=self.update_feeds_ratio)
+        self.bind(
+            multi_start_enabled=self._update_multi_start_display_texts,
+            thread_starts=self._update_multi_start_display_texts,
+            selected_pitch=self._update_multi_start_display_texts,
+            metric_mode=self._update_multi_start_display_texts,
+            nominal_thread_diameter=self._update_multi_start_display_texts,
+        )
 
     def toggle_is_running(self):
         if not self.is_running:
@@ -128,11 +158,12 @@ class AssistedThreadingBar(BoxLayout, SavingDispatcher):
 
         ratio = self.current_feeds_table[self.current_feeds_index].ratio
         spindle_axis = self.app.els.get_spindle_axis()
+        effective_starts = self.thread_starts if self.multi_start_enabled else 1
         if spindle_axis is not None:
             direction = -1 if self.left_hand_thread else 1
-            spindle_axis.syncRatioNum = ratio.numerator * direction
+            spindle_axis.syncRatioNum = ratio.numerator * effective_starts * direction
             spindle_axis.syncRatioDen = ratio.denominator
-        log.info(f"Configured ratio is: {ratio.numerator}/{ratio.denominator}, left_hand_thread={self.left_hand_thread}")
+        log.info(f"Configured ratio: {ratio.numerator}/{ratio.denominator}, left_hand={self.left_hand_thread}, effective_starts={effective_starts}")
 
     def open_settings(self):
         from rcp.components.home.assisted_threading.settings_popup import AssistedThreadingSettingsPopup
@@ -236,3 +267,33 @@ class AssistedThreadingBar(BoxLayout, SavingDispatcher):
             self.retract_button_enabled = self.retract_button_condition_fn()
         else:
             self.retract_button_enabled = True
+
+    def _update_multi_start_display_texts(self, *_):
+        """Recompute lead display and max-starts warning texts."""
+        if not self.multi_start_enabled or not self.selected_pitch:
+            self.lead_display_text = ""
+            self.max_starts_warning_text = ""
+            return
+        try:
+            pitch_val = float(self.selected_pitch)
+        except (ValueError, TypeError):
+            self.lead_display_text = ""
+            self.max_starts_warning_text = ""
+            return
+        if pitch_val <= 0:
+            self.lead_display_text = ""
+            self.max_starts_warning_text = ""
+            return
+
+        unit = "mm" if self.metric_mode else "in"
+        lead = pitch_val * self.thread_starts
+        self.lead_display_text = f"Lead: {lead:.3f}{unit}  ({self.thread_starts} × {self.selected_pitch}{unit})"
+
+        warnings = []
+        if self.thread_starts > 6:
+            warnings.append("More than 6 starts is unusual")
+        if self.nominal_thread_diameter > 0:
+            max_starts = int(math.pi * self.nominal_thread_diameter / pitch_val)
+            if self.thread_starts > max_starts:
+                warnings.append(f"May not fit on Ø{self.nominal_thread_diameter:.1f}{unit} (max ~{max_starts})")
+        self.max_starts_warning_text = "  |  ".join(warnings)

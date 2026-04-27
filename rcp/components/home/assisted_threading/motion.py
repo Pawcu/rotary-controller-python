@@ -171,7 +171,9 @@ class AssistedThreadingMotionMixin:
         self._start_position_preloaded = True
 
         next_step = self.current_step + 1
-        if self._is_cross_slide_at_final_cutting_depth():
+        # For multi-start, _on_threading_pass_complete handles routing to step 8;
+        # always go to cut step here so each start gets its own pass.
+        if not self.bar.multi_start_enabled and self._is_cross_slide_at_final_cutting_depth():
             next_step += 1
 
         self.goto_step(next_step)
